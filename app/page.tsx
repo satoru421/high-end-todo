@@ -8,7 +8,7 @@ const STORAGE_KEY = "aeterna.command-center.v2";
 type ViewMode = "Zen" | "Today" | "ToDo" | "Calendar" | "Focus";
 type CalendarSpan = "day" | "week" | "month" | "year";
 type GoalMap = Record<CalendarSpan, string>;
-type TodoItem = { id: string; title: string; time: string };
+type TodoItem = { id: string; title: string; time: string; date: string };
 
 const fadeInUp = {
   hidden: { opacity: 0, y: 30 },
@@ -18,6 +18,75 @@ const fadeInUp = {
 const navItems: ViewMode[] = ["Zen", "Today", "ToDo", "Calendar", "Focus"];
 const spans: CalendarSpan[] = ["day", "week", "month", "year"];
 const hours = Array.from({ length: 24 }, (_, i) => `${String(i).padStart(2, "0")}:00`);
+
+function toDateKey(date: Date): string {
+  const year = date.getFullYear();
+  const month = String(date.getMonth() + 1).padStart(2, "0");
+  const day = String(date.getDate()).padStart(2, "0");
+  return `${year}-${month}-${day}`;
+}
+
+function normalizeTodoDate(todos: TodoItem[]): TodoItem[] {
+  const today = toDateKey(new Date());
+  return todos.map((todo) => ({
+    ...todo,
+    date: todo.date ?? today,
+  }));
+}
+
+function buildMonthCells(baseDate: Date): Array<{ key: string; label: number; inMonth: boolean }> {
+  const year = baseDate.getFullYear();
+  const month = baseDate.getMonth();
+  const firstDay = new Date(year, month, 1);
+  const startWeekday = firstDay.getDay();
+  const daysInMonth = new Date(year, month + 1, 0).getDate();
+  const result: Array<{ key: string; label: number; inMonth: boolean }> = [];
+
+  for (let i = 0; i < startWeekday; i += 1) {
+    result.push({ key: `pad-start-${i}`, label: 0, inMonth: false });
+  }
+
+  for (let day = 1; day <= daysInMonth; day += 1) {
+    result.push({
+      key: toDateKey(new Date(year, month, day)),
+      label: day,
+      inMonth: true,
+    });
+  }
+
+  while (result.length % 7 !== 0) {
+    result.push({ key: `pad-end-${result.length}`, label: 0, inMonth: false });
+  }
+  return result;
+}
+
+function buildYearCells(year: number): string[] {
+  const start = new Date(year, 0, 1);
+  const end = new Date(year + 1, 0, 1);
+  const cells: string[] = [];
+  const cursor = new Date(start);
+  while (cursor < end) {
+    cells.push(toDateKey(cursor));
+    cursor.setDate(cursor.getDate() + 1);
+  }
+  return cells;
+}
+
+function getDensityLevel(count: number): 0 | 1 | 2 | 3 | 4 {
+  if (count <= 0) return 0;
+  if (count === 1) return 1;
+  if (count === 2) return 2;
+  if (count === 3) return 3;
+  return 4;
+}
+
+function densityTone(level: 0 | 1 | 2 | 3 | 4): string {
+  if (level === 0) return "bg-white/[0.02]";
+  if (level === 1) return "bg-white/[0.04]";
+  if (level === 2) return "bg-white/[0.06] shadow-[0_0_12px_rgba(236,240,255,0.2)]";
+  if (level === 3) return "bg-white/[0.1] shadow-[0_0_16px_rgba(236,240,255,0.28)]";
+  return "bg-white/[0.14] shadow-[0_0_22px_rgba(236,240,255,0.38)]";
+}
 
 function readStorage() {
   if (typeof window === "undefined") return null;
@@ -34,6 +103,7 @@ function readStorage() {
       calendarSpan: CalendarSpan;
       goals: GoalMap;
       focusNote: string;
+      todoDate: string;
     };
   } catch {
     return null;
@@ -49,17 +119,21 @@ export default function Home() {
   const [todayNote, setTodayNote] = useState(initial?.todayNote ?? "");
   const [todoDraft, setTodoDraft] = useState(initial?.todoDraft ?? "");
   const [todoTime, setTodoTime] = useState(initial?.todoTime ?? "09:00");
+  const [todoDate, setTodoDate] = useState(initial?.todoDate ?? toDateKey(new Date()));
   const [todos, setTodos] = useState<TodoItem[]>(
-    initial?.todos ?? [
-      { id: "seed-1", title: "Board sync", time: "09:00" },
-      { id: "seed-2", title: "Deep work block", time: "14:00" },
-    ],
+    normalizeTodoDate(
+      initial?.todos ?? [
+        { id: "seed-1", title: "Board sync", time: "09:00", date: toDateKey(new Date()) },
+        { id: "seed-2", title: "Deep work block", time: "14:00", date: toDateKey(new Date()) },
+      ],
+    ),
   );
   const [calendarSpan, setCalendarSpan] = useState<CalendarSpan>(initial?.calendarSpan ?? "day");
   const [goals, setGoals] = useState<GoalMap>(
     initial?.goals ?? { day: "", week: "", month: "", year: "" },
   );
   const [focusNote, setFocusNote] = useState(initial?.focusNote ?? "");
+  const [snapshotNow] = useState(() => Date.now());
 
   useEffect(() => {
     window.localStorage.setItem(
@@ -70,13 +144,14 @@ export default function Home() {
         todayNote,
         todoDraft,
         todoTime,
+        todoDate,
         todos,
         calendarSpan,
         goals,
         focusNote,
       }),
     );
-  }, [activeView, zenCommitment, todayNote, todoDraft, todoTime, todos, calendarSpan, goals, focusNote]);
+  }, [activeView, zenCommitment, todayNote, todoDraft, todoTime, todoDate, todos, calendarSpan, goals, focusNote]);
 
   const timelineByHour = useMemo(() => {
     return hours.map((hour) => {
@@ -85,15 +160,35 @@ export default function Home() {
     });
   }, [todos]);
 
-  const densityGrid = useMemo(() => {
-    const cellCount = calendarSpan === "year" ? 48 : 35;
-    const factor = todos.length + goals[calendarSpan].length;
-    return Array.from({ length: cellCount }, (_, idx) => ((idx * 7 + factor) % 5) as 0 | 1 | 2 | 3 | 4);
-  }, [calendarSpan, todos.length, goals]);
+  const monthCells = useMemo(() => buildMonthCells(new Date()), []);
+  const yearCells = useMemo(() => buildYearCells(2026), []);
+  const tasksByDate = useMemo(() => {
+    const map = new Map<string, number>();
+    for (const todo of todos) {
+      map.set(todo.date, (map.get(todo.date) ?? 0) + 1);
+    }
+    return map;
+  }, [todos]);
+
+  const progress2026 = useMemo(() => {
+    const start = new Date(2026, 0, 1).getTime();
+    const end = new Date(2027, 0, 1).getTime();
+    const clamped = Math.min(Math.max(snapshotNow, start), end);
+    const ratio = (clamped - start) / (end - start);
+    const remainingDays = Math.max(0, Math.ceil((end - clamped) / (1000 * 60 * 60 * 24)));
+    return {
+      ratio,
+      percentage: ratio * 100,
+      remainingDays,
+    };
+  }, [snapshotNow]);
 
   function addTodo() {
     if (!todoDraft.trim()) return;
-    setTodos((prev) => [{ id: crypto.randomUUID(), title: todoDraft.trim(), time: todoTime }, ...prev]);
+    setTodos((prev) => [
+      { id: crypto.randomUUID(), title: todoDraft.trim(), time: todoTime, date: todoDate },
+      ...prev,
+    ]);
     setTodoDraft("");
   }
 
@@ -219,6 +314,12 @@ export default function Home() {
                   type="time"
                   className="rounded-2xl border border-white/10 bg-black/20 px-3 py-2.5 text-sm outline-none"
                 />
+                <input
+                  value={todoDate}
+                  onChange={(event) => setTodoDate(event.target.value)}
+                  type="date"
+                  className="rounded-2xl border border-white/10 bg-black/20 px-3 py-2.5 text-sm outline-none sm:col-span-2"
+                />
                 <button
                   type="button"
                   onClick={addTodo}
@@ -231,7 +332,9 @@ export default function Home() {
                 {todos.map((todo) => (
                   <div key={todo.id} className="rounded-2xl border border-white/10 bg-white/[0.02] p-4">
                     <p className="text-sm text-ghost-white">{todo.title}</p>
-                    <p className="mt-1 text-xs text-slate-400">{todo.time}</p>
+                    <p className="mt-1 text-xs text-slate-400">
+                      {todo.date} • {todo.time}
+                    </p>
                   </div>
                 ))}
               </div>
@@ -277,25 +380,53 @@ export default function Home() {
                 />
               </div>
 
-              {calendarSpan === "month" || calendarSpan === "year" ? (
-                <div className="grid grid-cols-7 gap-2">
-                  {densityGrid.map((level, idx) => (
-                    <div
-                      key={`${calendarSpan}-${idx}`}
-                      className={`aspect-square rounded-lg border border-white/10 ${
-                        level === 0 && "bg-white/[0.02]"
-                      } ${level === 1 && "bg-white/[0.04]"} ${
-                        level === 2 && "bg-white/[0.06] shadow-[0_0_12px_rgba(236,240,255,0.2)]"
-                      } ${level === 3 && "bg-white/[0.1] shadow-[0_0_16px_rgba(236,240,255,0.28)]"} ${
-                        level === 4 && "bg-white/[0.14] shadow-[0_0_22px_rgba(236,240,255,0.38)]"
-                      }`}
-                    />
-                  ))}
+              {calendarSpan === "month" ? (
+                <div className="space-y-3">
+                  <p className="text-xs uppercase tracking-[0.24em] text-slate-500">This Month Density</p>
+                  <div className="grid grid-cols-7 gap-2">
+                    {monthCells.map((cell) => (
+                      <div
+                        key={cell.key}
+                        className={`aspect-square rounded-lg border border-white/10 ${
+                          cell.inMonth
+                            ? densityTone(getDensityLevel(tasksByDate.get(cell.key) ?? 0))
+                            : "bg-transparent opacity-40"
+                        }`}
+                        title={cell.inMonth ? `${cell.key} (${tasksByDate.get(cell.key) ?? 0} tasks)` : ""}
+                      >
+                        {cell.inMonth ? (
+                          <span className="mt-1 block text-center text-[10px] text-slate-400">{cell.label}</span>
+                        ) : null}
+                      </div>
+                    ))}
+                  </div>
+                </div>
+              ) : calendarSpan === "year" ? (
+                <div className="space-y-6">
+                  <div className="space-y-3">
+                    <p className="text-xs uppercase tracking-[0.24em] text-slate-500">Year Density 2026</p>
+                    <div className="grid grid-cols-14 gap-1.5">
+                      {yearCells.map((key) => (
+                        <div
+                          key={key}
+                          className={`aspect-square rounded-[5px] border border-white/10 ${densityTone(
+                            getDensityLevel(tasksByDate.get(key) ?? 0),
+                          )}`}
+                          title={`${key} (${tasksByDate.get(key) ?? 0} tasks)`}
+                        />
+                      ))}
+                    </div>
+                  </div>
+
+                  <ChronosHourglass progress={progress2026.ratio} remainingDays={progress2026.remainingDays} />
                 </div>
               ) : (
                 <div className="space-y-2">
                   {hours.slice(8, 20).map((hour) => (
-                    <div key={hour} className="grid grid-cols-[60px,1fr] items-center gap-2">
+                    <div
+                      key={hour}
+                      className="grid grid-cols-[60px,1fr] items-center gap-2"
+                    >
                       <span className="text-xs text-slate-500">{hour}</span>
                       <div className="h-7 rounded-xl border border-white/10 bg-white/[0.03]" />
                     </div>
@@ -358,5 +489,80 @@ export default function Home() {
         ))}
       </motion.nav>
     </main>
+  );
+}
+
+function ChronosHourglass({
+  progress,
+  remainingDays,
+}: {
+  progress: number;
+  remainingDays: number;
+}) {
+  const clamped = Math.min(Math.max(progress, 0), 1);
+  const topClipY = 32 + clamped * 58;
+  const bottomClipY = 170 - clamped * 58;
+
+  return (
+    <div className="grid items-center gap-6 rounded-2xl border border-white/10 bg-white/[0.02] p-5 md:grid-cols-[220px,1fr]">
+      <svg viewBox="0 0 160 220" className="mx-auto w-40">
+        <defs>
+          <clipPath id="top-sand-clip">
+            <motion.rect
+              x="22"
+              y={32}
+              width="116"
+              height="58"
+              animate={{ y: topClipY, height: Math.max(2, 90 - topClipY) }}
+              transition={{ duration: 1.4, ease }}
+            />
+          </clipPath>
+          <clipPath id="bottom-sand-clip">
+            <motion.rect
+              x="22"
+              y={bottomClipY}
+              width="116"
+              height={170 - bottomClipY}
+              animate={{ y: bottomClipY, height: Math.max(2, 170 - bottomClipY) }}
+              transition={{ duration: 1.4, ease }}
+            />
+          </clipPath>
+        </defs>
+
+        <polygon points="20,30 140,30 80,102" fill="none" stroke="rgba(255,255,255,0.12)" strokeWidth="2" />
+        <polygon points="20,190 140,190 80,118" fill="none" stroke="rgba(255,255,255,0.12)" strokeWidth="2" />
+        <polygon
+          points="22,32 138,32 80,100"
+          fill="rgba(233,236,255,0.24)"
+          clipPath="url(#top-sand-clip)"
+        />
+        <polygon
+          points="22,188 138,188 80,120"
+          fill="rgba(233,236,255,0.36)"
+          clipPath="url(#bottom-sand-clip)"
+        />
+
+        {Array.from({ length: 8 }, (_, i) => (
+          <motion.circle
+            key={`grain-${i}`}
+            cx={80 + (i % 2 === 0 ? -1.5 : 1.5)}
+            cy={106}
+            r="1.2"
+            fill="rgba(245,247,255,0.75)"
+            animate={{ cy: [106, 114, 122], opacity: [0, 1, 0] }}
+            transition={{ duration: 0.9, repeat: Infinity, delay: i * 0.11, ease: "linear" }}
+          />
+        ))}
+      </svg>
+
+      <div>
+        <p className="text-3xl font-thin tracking-wide text-ghost-white">
+          Year Progress: {`${(clamped * 100).toFixed(1)}%`}
+        </p>
+        <p className="mt-2 font-serif text-2xl text-slate-300">
+          残り {remainingDays}日。君は何を成し遂げる？
+        </p>
+      </div>
+    </div>
   );
 }
