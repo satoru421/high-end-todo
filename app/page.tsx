@@ -1,14 +1,14 @@
 "use client";
 
 import { AnimatePresence, motion } from "framer-motion";
-import { useEffect, useMemo, useState } from "react";
+import { useEffect, useMemo, useRef, useState } from "react";
 
 const ease = [0.22, 1, 0.36, 1] as const;
 const STORAGE_KEY = "aeterna.command-center.v2";
 type ViewMode = "Zen" | "Today" | "ToDo" | "Calendar" | "Focus";
 type CalendarSpan = "day" | "week" | "month" | "year";
 type GoalMap = Record<CalendarSpan, string>;
-type TodoItem = { id: string; title: string; time: string; date: string };
+type TodoItem = { id: string; title: string; scheduledTime: string; date: string };
 
 const fadeInUp = {
   hidden: { opacity: 0, y: 30 },
@@ -18,6 +18,8 @@ const fadeInUp = {
 const navItems: ViewMode[] = ["Zen", "Today", "ToDo", "Calendar", "Focus"];
 const spans: CalendarSpan[] = ["day", "week", "month", "year"];
 const hours = Array.from({ length: 24 }, (_, i) => `${String(i).padStart(2, "0")}:00`);
+const missionHours = Array.from({ length: 12 }, (_, i) => `${String(i + 8).padStart(2, "0")}:00`);
+const monthNames = ["Jan", "Feb", "Mar", "Apr", "May", "Jun", "Jul", "Aug", "Sep", "Oct", "Nov", "Dec"];
 
 function toDateKey(date: Date): string {
   const year = date.getFullYear();
@@ -28,10 +30,14 @@ function toDateKey(date: Date): string {
 
 function normalizeTodoDate(todos: TodoItem[]): TodoItem[] {
   const today = toDateKey(new Date());
-  return todos.map((todo) => ({
-    ...todo,
-    date: todo.date ?? today,
-  }));
+  return todos.map((todo) => {
+    const legacy = todo as TodoItem & { time?: string };
+    return {
+      ...todo,
+      date: todo.date ?? today,
+      scheduledTime: todo.scheduledTime ?? legacy.time ?? "09:00",
+    };
+  });
 }
 
 function buildMonthCells(baseDate: Date): Array<{ key: string; label: number; inMonth: boolean }> {
@@ -60,18 +66,6 @@ function buildMonthCells(baseDate: Date): Array<{ key: string; label: number; in
   return result;
 }
 
-function buildYearCells(year: number): string[] {
-  const start = new Date(year, 0, 1);
-  const end = new Date(year + 1, 0, 1);
-  const cells: string[] = [];
-  const cursor = new Date(start);
-  while (cursor < end) {
-    cells.push(toDateKey(cursor));
-    cursor.setDate(cursor.getDate() + 1);
-  }
-  return cells;
-}
-
 function getDensityLevel(count: number): 0 | 1 | 2 | 3 | 4 {
   if (count <= 0) return 0;
   if (count === 1) return 1;
@@ -88,6 +82,32 @@ function densityTone(level: 0 | 1 | 2 | 3 | 4): string {
   return "bg-white/[0.14] shadow-[0_0_22px_rgba(236,240,255,0.38)]";
 }
 
+function startOfWeekMonday(baseDate: Date): Date {
+  const start = new Date(baseDate);
+  const day = start.getDay();
+  const diff = day === 0 ? -6 : 1 - day;
+  start.setDate(start.getDate() + diff);
+  start.setHours(0, 0, 0, 0);
+  return start;
+}
+
+function closestHourFromPoint(
+  pointY: number,
+  slotRefs: Record<string, HTMLDivElement | null>,
+): { hour: string; distance: number } | null {
+  let closest: { hour: string; distance: number } | null = null;
+  for (const [hour, element] of Object.entries(slotRefs)) {
+    if (!element) continue;
+    const rect = element.getBoundingClientRect();
+    const centerY = rect.top + rect.height / 2;
+    const distance = Math.abs(pointY - centerY);
+    if (!closest || distance < closest.distance) {
+      closest = { hour, distance };
+    }
+  }
+  return closest;
+}
+
 function readStorage() {
   if (typeof window === "undefined") return null;
   try {
@@ -99,11 +119,13 @@ function readStorage() {
       todayNote: string;
       todoDraft: string;
       todoTime: string;
+      todoDate: string;
       todos: TodoItem[];
       calendarSpan: CalendarSpan;
       goals: GoalMap;
       focusNote: string;
-      todoDate: string;
+      weekGoals: Record<string, string>;
+      monthMilestones: Record<string, string>;
     };
   } catch {
     return null;
@@ -123,8 +145,8 @@ export default function Home() {
   const [todos, setTodos] = useState<TodoItem[]>(
     normalizeTodoDate(
       initial?.todos ?? [
-        { id: "seed-1", title: "Board sync", time: "09:00", date: toDateKey(new Date()) },
-        { id: "seed-2", title: "Deep work block", time: "14:00", date: toDateKey(new Date()) },
+        { id: "seed-1", title: "Board sync", scheduledTime: "09:00", date: toDateKey(new Date()) },
+        { id: "seed-2", title: "Deep work block", scheduledTime: "14:00", date: toDateKey(new Date()) },
       ],
     ),
   );
@@ -134,6 +156,13 @@ export default function Home() {
   );
   const [focusNote, setFocusNote] = useState(initial?.focusNote ?? "");
   const [snapshotNow] = useState(() => Date.now());
+  const [draggingTodoId, setDraggingTodoId] = useState<string | null>(null);
+  const [dragHoverHour, setDragHoverHour] = useState<string | null>(null);
+  const slotRefs = useRef<Record<string, HTMLDivElement | null>>({});
+  const [weekGoals, setWeekGoals] = useState<Record<string, string>>(initial?.weekGoals ?? {});
+  const [monthMilestones, setMonthMilestones] = useState<Record<string, string>>(
+    initial?.monthMilestones ?? {},
+  );
 
   useEffect(() => {
     window.localStorage.setItem(
@@ -149,19 +178,33 @@ export default function Home() {
         calendarSpan,
         goals,
         focusNote,
+        weekGoals,
+        monthMilestones,
       }),
     );
-  }, [activeView, zenCommitment, todayNote, todoDraft, todoTime, todoDate, todos, calendarSpan, goals, focusNote]);
+  }, [
+    activeView,
+    zenCommitment,
+    todayNote,
+    todoDraft,
+    todoTime,
+    todoDate,
+    todos,
+    calendarSpan,
+    goals,
+    focusNote,
+    weekGoals,
+    monthMilestones,
+  ]);
 
   const timelineByHour = useMemo(() => {
     return hours.map((hour) => {
-      const bucket = todos.filter((todo) => todo.time.slice(0, 2) === hour.slice(0, 2));
+      const bucket = todos.filter((todo) => todo.scheduledTime.slice(0, 2) === hour.slice(0, 2));
       return { hour, bucket };
     });
   }, [todos]);
 
   const monthCells = useMemo(() => buildMonthCells(new Date()), []);
-  const yearCells = useMemo(() => buildYearCells(2026), []);
   const tasksByDate = useMemo(() => {
     const map = new Map<string, number>();
     for (const todo of todos) {
@@ -183,13 +226,51 @@ export default function Home() {
     };
   }, [snapshotNow]);
 
+  const weekDays = useMemo(() => {
+    const start = startOfWeekMonday(new Date());
+    return Array.from({ length: 7 }, (_, index) => {
+      const date = new Date(start);
+      date.setDate(start.getDate() + index);
+      return {
+        key: toDateKey(date),
+        label: `${["Mon", "Tue", "Wed", "Thu", "Fri", "Sat", "Sun"][index]} ${date.getDate()}`,
+      };
+    });
+  }, []);
+
+  const yearMonthDensity = useMemo(() => {
+    const counts = Array.from({ length: 12 }, () => 0);
+    for (const todo of todos) {
+      if (!todo.date.startsWith("2026-")) continue;
+      const month = Number(todo.date.slice(5, 7)) - 1;
+      if (month >= 0 && month < 12) counts[month] += 1;
+    }
+    return counts;
+  }, [todos]);
+
   function addTodo() {
     if (!todoDraft.trim()) return;
     setTodos((prev) => [
-      { id: crypto.randomUUID(), title: todoDraft.trim(), time: todoTime, date: todoDate },
+      { id: crypto.randomUUID(), title: todoDraft.trim(), scheduledTime: todoTime, date: todoDate },
       ...prev,
     ]);
     setTodoDraft("");
+  }
+
+  function updateTodoSchedule(todoId: string, hour: string) {
+    const today = toDateKey(new Date());
+    const scheduledTime = `${hour.slice(0, 2)}:00`;
+    setTodos((prev) =>
+      prev.map((todo) =>
+        todo.id === todoId
+          ? {
+              ...todo,
+              scheduledTime,
+              date: today,
+            }
+          : todo,
+      ),
+    );
   }
 
   return (
@@ -262,10 +343,54 @@ export default function Home() {
                 placeholder="Todayの戦術メモ..."
               />
               <div className="max-h-64 space-y-2 overflow-auto pr-1">
+                <div className="mb-3 flex gap-2 overflow-auto pb-1">
+                  {todos.map((todo) => (
+                    <motion.div
+                      key={`draggable-${todo.id}`}
+                      drag
+                      dragMomentum={false}
+                      dragElastic={0.08}
+                      whileDrag={{
+                        scale: 1.03,
+                        backgroundColor: "rgba(255,255,255,0.15)",
+                        borderColor: "rgba(255,255,255,0.35)",
+                        boxShadow: "0 0 24px rgba(226,232,255,0.45)",
+                        opacity: 0.88,
+                      }}
+                      onDragStart={() => setDraggingTodoId(todo.id)}
+                      onDrag={(_, info) => {
+                        const closest = closestHourFromPoint(info.point.y, slotRefs.current);
+                        setDragHoverHour(closest?.distance && closest.distance < 70 ? closest.hour : null);
+                      }}
+                      onDragEnd={(_, info) => {
+                        const closest = closestHourFromPoint(info.point.y, slotRefs.current);
+                        if (closest && closest.distance < 70) {
+                          updateTodoSchedule(todo.id, closest.hour);
+                        }
+                        setDraggingTodoId(null);
+                        setDragHoverHour(null);
+                      }}
+                      className={`shrink-0 rounded-full border border-white/15 bg-white/[0.06] px-3 py-1 text-xs backdrop-blur-lg touch-none ${
+                        draggingTodoId === todo.id ? "text-ghost-white" : "text-slate-300"
+                      }`}
+                    >
+                      {todo.title}
+                    </motion.div>
+                  ))}
+                </div>
                 {timelineByHour.map(({ hour, bucket }) => (
                   <div key={hour} className="grid grid-cols-[60px,1fr] items-center gap-2">
                     <span className="text-xs text-slate-500">{hour}</span>
-                    <div className="min-h-8 rounded-xl border border-white/10 bg-white/[0.02] px-3 py-1.5">
+                    <div
+                      ref={(element) => {
+                        slotRefs.current[hour] = element;
+                      }}
+                      className={`min-h-8 rounded-xl border px-3 py-1.5 transition ${
+                        dragHoverHour === hour
+                          ? "border-white/30 bg-white/[0.08] shadow-[0_0_22px_rgba(236,240,255,0.35)]"
+                          : "border-white/10 bg-white/[0.02]"
+                      }`}
+                    >
                       {bucket.length === 0 ? (
                         <div className="h-2 w-full rounded-full bg-white/[0.03]" />
                       ) : (
@@ -275,7 +400,7 @@ export default function Home() {
                               key={item.id}
                               className="rounded-lg border border-white/15 bg-white/[0.06] px-2 py-1 text-xs shadow-[0_0_16px_rgba(233,236,255,0.3)]"
                             >
-                              {item.title}
+                              {item.title} • {item.scheduledTime}
                             </p>
                           ))}
                         </div>
@@ -318,7 +443,7 @@ export default function Home() {
                   value={todoDate}
                   onChange={(event) => setTodoDate(event.target.value)}
                   type="date"
-                  className="rounded-2xl border border-white/10 bg-black/20 px-3 py-2.5 text-sm outline-none sm:col-span-2"
+                    className="rounded-2xl border border-white/10 bg-black/20 px-3 py-2.5 text-sm outline-none sm:col-span-2"
                 />
                 <button
                   type="button"
@@ -333,7 +458,7 @@ export default function Home() {
                   <div key={todo.id} className="rounded-2xl border border-white/10 bg-white/[0.02] p-4">
                     <p className="text-sm text-ghost-white">{todo.title}</p>
                     <p className="mt-1 text-xs text-slate-400">
-                      {todo.date} • {todo.time}
+                      {todo.date} • {todo.scheduledTime}
                     </p>
                   </div>
                 ))}
@@ -380,7 +505,48 @@ export default function Home() {
                 />
               </div>
 
-              {calendarSpan === "month" ? (
+              {calendarSpan === "week" ? (
+                <div className="space-y-3">
+                  <p className="text-xs uppercase tracking-[0.24em] text-slate-500">Daily Mission View</p>
+                  <div className="grid gap-2 md:grid-cols-7">
+                    {weekDays.map((day) => {
+                      const dayTasks = todos.filter((todo) => todo.date === day.key);
+                      return (
+                        <div
+                          key={day.key}
+                          className="rounded-2xl border border-white/10 bg-white/[0.02] p-3"
+                        >
+                          <p className="text-[11px] uppercase tracking-[0.16em] text-slate-400">
+                            {day.label}
+                          </p>
+                          <input
+                            value={weekGoals[day.key] ?? ""}
+                            onChange={(event) =>
+                              setWeekGoals((prev) => ({ ...prev, [day.key]: event.target.value }))
+                            }
+                            placeholder="Top goal"
+                            className="mt-2 w-full rounded-xl border border-white/10 bg-black/20 px-2 py-1.5 text-xs outline-none placeholder:text-slate-500"
+                          />
+                          <div className="mt-3 space-y-1.5">
+                            {dayTasks.length === 0 ? (
+                              <p className="text-[11px] text-slate-500">No mission</p>
+                            ) : (
+                              dayTasks.map((todo) => (
+                                <p
+                                  key={todo.id}
+                                  className="rounded-lg border border-white/10 bg-white/[0.05] px-2 py-1 text-[11px]"
+                                >
+                                  {todo.scheduledTime} {todo.title}
+                                </p>
+                              ))
+                            )}
+                          </div>
+                        </div>
+                      );
+                    })}
+                  </div>
+                </div>
+              ) : calendarSpan === "month" ? (
                 <div className="space-y-3">
                   <p className="text-xs uppercase tracking-[0.24em] text-slate-500">This Month Density</p>
                   <div className="grid grid-cols-7 gap-2">
@@ -404,16 +570,43 @@ export default function Home() {
               ) : calendarSpan === "year" ? (
                 <div className="space-y-6">
                   <div className="space-y-3">
-                    <p className="text-xs uppercase tracking-[0.24em] text-slate-500">Year Density 2026</p>
-                    <div className="grid grid-cols-14 gap-1.5">
-                      {yearCells.map((key) => (
+                    <p className="text-xs uppercase tracking-[0.24em] text-slate-500">
+                      Executive Year • Monthly Milestones
+                    </p>
+                    <div className="grid gap-3 md:grid-cols-3">
+                      {monthNames.map((month, index) => (
                         <div
-                          key={key}
-                          className={`aspect-square rounded-[5px] border border-white/10 ${densityTone(
-                            getDensityLevel(tasksByDate.get(key) ?? 0),
-                          )}`}
-                          title={`${key} (${tasksByDate.get(key) ?? 0} tasks)`}
-                        />
+                          key={month}
+                          className="rounded-2xl border border-white/10 bg-white/[0.02] p-3"
+                        >
+                          <p className="text-xs uppercase tracking-[0.2em] text-slate-400">{month}</p>
+                          <textarea
+                            value={monthMilestones[String(index)] ?? ""}
+                            onChange={(event) =>
+                              setMonthMilestones((prev) => ({ ...prev, [String(index)]: event.target.value }))
+                            }
+                            placeholder="Milestone"
+                            className="mt-2 h-14 w-full resize-none bg-transparent text-xs outline-none placeholder:text-slate-500"
+                          />
+                          <div className="mt-2 flex flex-wrap gap-1">
+                            {Array.from({
+                              length: Math.max(1, Math.min(12, yearMonthDensity[index] === 0 ? 1 : yearMonthDensity[index] * 2)),
+                            }).map((_, dotIndex) => (
+                              <span
+                                key={`${month}-dot-${dotIndex}`}
+                                className={`h-1.5 w-1.5 rounded-full ${
+                                  yearMonthDensity[index] === 0
+                                    ? "bg-white/10"
+                                    : yearMonthDensity[index] < 3
+                                      ? "bg-white/30"
+                                      : yearMonthDensity[index] < 6
+                                        ? "bg-white/50 shadow-[0_0_8px_rgba(236,240,255,0.35)]"
+                                        : "bg-white/70 shadow-[0_0_10px_rgba(236,240,255,0.5)]"
+                                }`}
+                              />
+                            ))}
+                          </div>
+                        </div>
                       ))}
                     </div>
                   </div>
@@ -422,7 +615,7 @@ export default function Home() {
                 </div>
               ) : (
                 <div className="space-y-2">
-                  {hours.slice(8, 20).map((hour) => (
+                  {missionHours.map((hour) => (
                     <div
                       key={hour}
                       className="grid grid-cols-[60px,1fr] items-center gap-2"
