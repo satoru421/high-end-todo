@@ -4,11 +4,32 @@ import { AnimatePresence, motion } from "framer-motion";
 import { useEffect, useMemo, useRef, useState } from "react";
 
 const ease = [0.22, 1, 0.36, 1] as const;
-const STORAGE_KEY = "aeterna.command-center.v2";
+const STORAGE_KEY = "aeterna.command-center.v3";
 type ViewMode = "Zen" | "Today" | "ToDo" | "Calendar" | "Focus";
 type CalendarSpan = "day" | "week" | "month" | "year";
 type GoalMap = Record<CalendarSpan, string>;
-type TodoItem = { id: string; title: string; scheduledTime: string; date: string };
+type TodoItem = {
+  id: string;
+  title: string;
+  scheduledTime: string;
+  date: string;
+  completed: boolean;
+};
+type AeternaState = {
+  version: 3;
+  activeView: ViewMode;
+  zenCommitment: string;
+  todayNote: string;
+  todoDraft: string;
+  todoTime: string;
+  todoDate: string;
+  todos: TodoItem[];
+  calendarSpan: CalendarSpan;
+  goals: GoalMap;
+  focusNote: string;
+  weekGoals: Record<string, string>;
+  monthMilestones: Record<string, string>;
+};
 
 const fadeInUp = {
   hidden: { opacity: 0, y: 30 },
@@ -31,11 +52,12 @@ function toDateKey(date: Date): string {
 function normalizeTodoDate(todos: TodoItem[]): TodoItem[] {
   const today = toDateKey(new Date());
   return todos.map((todo) => {
-    const legacy = todo as TodoItem & { time?: string };
+    const legacy = todo as TodoItem & { time?: string; completed?: boolean };
     return {
       ...todo,
       date: todo.date ?? today,
       scheduledTime: todo.scheduledTime ?? legacy.time ?? "09:00",
+      completed: Boolean(legacy.completed),
     };
   });
 }
@@ -112,21 +134,29 @@ function readStorage() {
   if (typeof window === "undefined") return null;
   try {
     const raw = window.localStorage.getItem(STORAGE_KEY);
-    if (!raw) return null;
-    return JSON.parse(raw) as {
-      activeView: ViewMode;
-      zenCommitment: string;
-      todayNote: string;
-      todoDraft: string;
-      todoTime: string;
-      todoDate: string;
-      todos: TodoItem[];
-      calendarSpan: CalendarSpan;
-      goals: GoalMap;
-      focusNote: string;
-      weekGoals: Record<string, string>;
-      monthMilestones: Record<string, string>;
+    if (raw) {
+      return JSON.parse(raw) as AeternaState;
+    }
+
+    const legacyRaw = window.localStorage.getItem("aeterna.command-center.v2");
+    if (!legacyRaw) return null;
+    const legacy = JSON.parse(legacyRaw) as Partial<AeternaState>;
+    const migrated: AeternaState = {
+      version: 3,
+      activeView: legacy.activeView ?? "Zen",
+      zenCommitment: legacy.zenCommitment ?? "この静寂の中で、最も重要な決断を下す。",
+      todayNote: legacy.todayNote ?? "",
+      todoDraft: legacy.todoDraft ?? "",
+      todoTime: legacy.todoTime ?? "09:00",
+      todoDate: legacy.todoDate ?? toDateKey(new Date()),
+      todos: normalizeTodoDate((legacy.todos ?? []) as TodoItem[]),
+      calendarSpan: legacy.calendarSpan ?? "day",
+      goals: legacy.goals ?? { day: "", week: "", month: "", year: "" },
+      focusNote: legacy.focusNote ?? "",
+      weekGoals: legacy.weekGoals ?? {},
+      monthMilestones: legacy.monthMilestones ?? {},
     };
+    return migrated;
   } catch {
     return null;
   }
@@ -145,8 +175,20 @@ export default function Home() {
   const [todos, setTodos] = useState<TodoItem[]>(
     normalizeTodoDate(
       initial?.todos ?? [
-        { id: "seed-1", title: "Board sync", scheduledTime: "09:00", date: toDateKey(new Date()) },
-        { id: "seed-2", title: "Deep work block", scheduledTime: "14:00", date: toDateKey(new Date()) },
+        {
+          id: "seed-1",
+          title: "Board sync",
+          scheduledTime: "09:00",
+          date: toDateKey(new Date()),
+          completed: false,
+        },
+        {
+          id: "seed-2",
+          title: "Deep work block",
+          scheduledTime: "14:00",
+          date: toDateKey(new Date()),
+          completed: false,
+        },
       ],
     ),
   );
@@ -155,7 +197,7 @@ export default function Home() {
     initial?.goals ?? { day: "", week: "", month: "", year: "" },
   );
   const [focusNote, setFocusNote] = useState(initial?.focusNote ?? "");
-  const [snapshotNow] = useState(() => Date.now());
+  const [nowMs, setNowMs] = useState(() => Date.now());
   const [draggingTodoId, setDraggingTodoId] = useState<string | null>(null);
   const [dragHoverHour, setDragHoverHour] = useState<string | null>(null);
   const slotRefs = useRef<Record<string, HTMLDivElement | null>>({});
@@ -163,24 +205,33 @@ export default function Home() {
   const [monthMilestones, setMonthMilestones] = useState<Record<string, string>>(
     initial?.monthMilestones ?? {},
   );
+  const [editingTodoId, setEditingTodoId] = useState<string | null>(null);
+  const [editingTodoTitle, setEditingTodoTitle] = useState("");
 
   useEffect(() => {
+    const intervalId = window.setInterval(() => setNowMs(Date.now()), 60000);
+    return () => window.clearInterval(intervalId);
+  }, []);
+
+  useEffect(() => {
+    const payload: AeternaState = {
+      version: 3,
+      activeView,
+      zenCommitment,
+      todayNote,
+      todoDraft,
+      todoTime,
+      todoDate,
+      todos,
+      calendarSpan,
+      goals,
+      focusNote,
+      weekGoals,
+      monthMilestones,
+    };
     window.localStorage.setItem(
       STORAGE_KEY,
-      JSON.stringify({
-        activeView,
-        zenCommitment,
-        todayNote,
-        todoDraft,
-        todoTime,
-        todoDate,
-        todos,
-        calendarSpan,
-        goals,
-        focusNote,
-        weekGoals,
-        monthMilestones,
-      }),
+      JSON.stringify(payload),
     );
   }, [
     activeView,
@@ -199,35 +250,40 @@ export default function Home() {
 
   const timelineByHour = useMemo(() => {
     return hours.map((hour) => {
-      const bucket = todos.filter((todo) => todo.scheduledTime.slice(0, 2) === hour.slice(0, 2));
+      const bucket = todos.filter(
+        (todo) => !todo.completed && todo.scheduledTime.slice(0, 2) === hour.slice(0, 2),
+      );
       return { hour, bucket };
     });
   }, [todos]);
 
-  const monthCells = useMemo(() => buildMonthCells(new Date()), []);
+  const nowDate = useMemo(() => new Date(nowMs), [nowMs]);
+  const monthCells = useMemo(() => buildMonthCells(nowDate), [nowDate]);
   const tasksByDate = useMemo(() => {
     const map = new Map<string, number>();
     for (const todo of todos) {
+      if (todo.completed) continue;
       map.set(todo.date, (map.get(todo.date) ?? 0) + 1);
     }
     return map;
   }, [todos]);
 
-  const progress2026 = useMemo(() => {
-    const start = new Date(2026, 0, 1).getTime();
-    const end = new Date(2027, 0, 1).getTime();
-    const clamped = Math.min(Math.max(snapshotNow, start), end);
+  const yearProgress = useMemo(() => {
+    const currentYear = nowDate.getFullYear();
+    const start = new Date(currentYear, 0, 1).getTime();
+    const end = new Date(currentYear + 1, 0, 1).getTime();
+    const clamped = Math.min(Math.max(nowMs, start), end);
     const ratio = (clamped - start) / (end - start);
     const remainingDays = Math.max(0, Math.ceil((end - clamped) / (1000 * 60 * 60 * 24)));
     return {
+      year: currentYear,
       ratio,
-      percentage: ratio * 100,
       remainingDays,
     };
-  }, [snapshotNow]);
+  }, [nowDate, nowMs]);
 
   const weekDays = useMemo(() => {
-    const start = startOfWeekMonday(new Date());
+    const start = startOfWeekMonday(nowDate);
     return Array.from({ length: 7 }, (_, index) => {
       const date = new Date(start);
       date.setDate(start.getDate() + index);
@@ -236,25 +292,62 @@ export default function Home() {
         label: `${["Mon", "Tue", "Wed", "Thu", "Fri", "Sat", "Sun"][index]} ${date.getDate()}`,
       };
     });
-  }, []);
+  }, [nowDate]);
 
   const yearMonthDensity = useMemo(() => {
     const counts = Array.from({ length: 12 }, () => 0);
     for (const todo of todos) {
-      if (!todo.date.startsWith("2026-")) continue;
+      if (!todo.date.startsWith(`${yearProgress.year}-`)) continue;
       const month = Number(todo.date.slice(5, 7)) - 1;
       if (month >= 0 && month < 12) counts[month] += 1;
     }
     return counts;
-  }, [todos]);
+  }, [todos, yearProgress.year]);
 
   function addTodo() {
     if (!todoDraft.trim()) return;
     setTodos((prev) => [
-      { id: crypto.randomUUID(), title: todoDraft.trim(), scheduledTime: todoTime, date: todoDate },
+      {
+        id: crypto.randomUUID(),
+        title: todoDraft.trim(),
+        scheduledTime: todoTime,
+        date: todoDate,
+        completed: false,
+      },
       ...prev,
     ]);
     setTodoDraft("");
+  }
+
+  function deleteTodo(todoId: string) {
+    setTodos((prev) => prev.filter((todo) => todo.id !== todoId));
+    if (editingTodoId === todoId) {
+      setEditingTodoId(null);
+      setEditingTodoTitle("");
+    }
+  }
+
+  function toggleTodoCompleted(todoId: string) {
+    setTodos((prev) =>
+      prev.map((todo) =>
+        todo.id === todoId ? { ...todo, completed: !todo.completed } : todo,
+      ),
+    );
+  }
+
+  function startEditTodo(todo: TodoItem) {
+    setEditingTodoId(todo.id);
+    setEditingTodoTitle(todo.title);
+  }
+
+  function saveEditTodo(todoId: string) {
+    const nextTitle = editingTodoTitle.trim();
+    if (!nextTitle) return;
+    setTodos((prev) =>
+      prev.map((todo) => (todo.id === todoId ? { ...todo, title: nextTitle } : todo)),
+    );
+    setEditingTodoId(null);
+    setEditingTodoTitle("");
   }
 
   function updateTodoSchedule(todoId: string, hour: string) {
@@ -303,6 +396,14 @@ export default function Home() {
               {activeView === "Zen" ? "一つのこと" : "AETERNA"}
             </span>
           </h1>
+          <p className="text-xs text-slate-500">
+            {nowDate.toLocaleDateString("ja-JP", {
+              year: "numeric",
+              month: "long",
+              day: "numeric",
+              weekday: "short",
+            })}
+          </p>
         </motion.div>
 
         <AnimatePresence mode="wait">
@@ -344,12 +445,16 @@ export default function Home() {
               />
               <div className="max-h-64 space-y-2 overflow-auto pr-1">
                 <div className="mb-3 flex gap-2 overflow-auto pb-1">
-                  {todos.map((todo) => (
+                  {todos
+                    .filter((todo) => !todo.completed)
+                    .map((todo) => (
                     <motion.div
                       key={`draggable-${todo.id}`}
                       drag
                       dragMomentum={false}
-                      dragElastic={0.08}
+                      dragElastic={0.02}
+                      dragTransition={{ power: 0.03, timeConstant: 120 }}
+                      dragSnapToOrigin
                       whileDrag={{
                         scale: 1.03,
                         backgroundColor: "rgba(255,255,255,0.15)",
@@ -360,11 +465,11 @@ export default function Home() {
                       onDragStart={() => setDraggingTodoId(todo.id)}
                       onDrag={(_, info) => {
                         const closest = closestHourFromPoint(info.point.y, slotRefs.current);
-                        setDragHoverHour(closest?.distance && closest.distance < 70 ? closest.hour : null);
+                        setDragHoverHour(closest?.distance && closest.distance < 85 ? closest.hour : null);
                       }}
                       onDragEnd={(_, info) => {
                         const closest = closestHourFromPoint(info.point.y, slotRefs.current);
-                        if (closest && closest.distance < 70) {
+                        if (closest && closest.distance < 85) {
                           updateTodoSchedule(todo.id, closest.hour);
                         }
                         setDraggingTodoId(null);
@@ -445,21 +550,80 @@ export default function Home() {
                   type="date"
                     className="rounded-2xl border border-white/10 bg-black/20 px-3 py-2.5 text-sm outline-none sm:col-span-2"
                 />
-                <button
+                <motion.button
                   type="button"
                   onClick={addTodo}
-                  className="rounded-2xl border border-white/20 bg-white/10 px-4 py-2.5 text-xs uppercase tracking-[0.2em]"
+                  whileTap={{ scale: 0.95 }}
+                  className="min-h-11 rounded-2xl border border-white/20 bg-white/10 px-4 py-2.5 text-xs uppercase tracking-[0.2em]"
                 >
                   Add
-                </button>
+                </motion.button>
               </div>
               <div className="space-y-3">
                 {todos.map((todo) => (
-                  <div key={todo.id} className="rounded-2xl border border-white/10 bg-white/[0.02] p-4">
-                    <p className="text-sm text-ghost-white">{todo.title}</p>
-                    <p className="mt-1 text-xs text-slate-400">
-                      {todo.date} • {todo.scheduledTime}
-                    </p>
+                  <div key={todo.id} className="group rounded-2xl border border-white/10 bg-white/[0.02] p-4">
+                    <div className="flex items-start justify-between gap-3">
+                      <motion.button
+                        type="button"
+                        onClick={() => toggleTodoCompleted(todo.id)}
+                        whileTap={{ scale: 0.95 }}
+                        className="min-h-11 flex-1 text-left"
+                      >
+                        {editingTodoId === todo.id ? (
+                          <input
+                            value={editingTodoTitle}
+                            onChange={(event) => setEditingTodoTitle(event.target.value)}
+                            onKeyDown={(event) => {
+                              if (event.key === "Enter") saveEditTodo(todo.id);
+                              if (event.key === "Escape") {
+                                setEditingTodoId(null);
+                                setEditingTodoTitle("");
+                              }
+                            }}
+                            className="w-full rounded-xl border border-white/15 bg-black/30 px-3 py-2 text-sm outline-none"
+                            autoFocus
+                          />
+                        ) : (
+                          <>
+                            <p className={`text-sm ${todo.completed ? "text-slate-500 line-through" : "text-ghost-white"}`}>
+                              {todo.title}
+                            </p>
+                            <p className="mt-1 text-xs text-slate-400">
+                              {todo.date} • {todo.scheduledTime}
+                            </p>
+                          </>
+                        )}
+                      </motion.button>
+                      <div className="flex gap-1 opacity-100 transition md:opacity-0 md:group-hover:opacity-100">
+                        {editingTodoId === todo.id ? (
+                          <motion.button
+                            type="button"
+                            whileTap={{ scale: 0.95 }}
+                            onClick={() => saveEditTodo(todo.id)}
+                            className="min-h-11 min-w-11 rounded-xl border border-white/20 bg-white/10 px-3 text-sm"
+                          >
+                            ✓
+                          </motion.button>
+                        ) : (
+                          <motion.button
+                            type="button"
+                            whileTap={{ scale: 0.95 }}
+                            onClick={() => startEditTodo(todo)}
+                            className="min-h-11 min-w-11 rounded-xl border border-white/20 bg-white/10 px-3 text-sm"
+                          >
+                            ✎
+                          </motion.button>
+                        )}
+                        <motion.button
+                          type="button"
+                          whileTap={{ scale: 0.95 }}
+                          onClick={() => deleteTodo(todo.id)}
+                          className="min-h-11 min-w-11 rounded-xl border border-white/10 bg-black/20 px-3 text-sm text-slate-300"
+                        >
+                          ×
+                        </motion.button>
+                      </div>
+                    </div>
                   </div>
                 ))}
               </div>
@@ -478,16 +642,17 @@ export default function Home() {
             >
               <div className="mb-4 flex w-full gap-1 rounded-2xl border border-white/10 bg-black/25 p-1">
                 {spans.map((span) => (
-                  <button
+                  <motion.button
                     key={span}
                     type="button"
                     onClick={() => setCalendarSpan(span)}
-                    className={`flex-1 rounded-xl px-3 py-2 text-xs uppercase tracking-[0.2em] transition ${
+                    whileTap={{ scale: 0.95 }}
+                    className={`min-h-11 flex-1 rounded-xl px-3 py-2 text-xs uppercase tracking-[0.2em] transition ${
                       calendarSpan === span ? "bg-white/10 text-ghost-white" : "text-slate-400"
                     }`}
                   >
                     {span}
-                  </button>
+                  </motion.button>
                 ))}
               </div>
 
@@ -571,7 +736,7 @@ export default function Home() {
                 <div className="space-y-6">
                   <div className="space-y-3">
                     <p className="text-xs uppercase tracking-[0.24em] text-slate-500">
-                      Executive Year • Monthly Milestones
+                      Executive Year • {yearProgress.year} Monthly Milestones
                     </p>
                     <div className="grid gap-3 md:grid-cols-3">
                       {monthNames.map((month, index) => (
@@ -611,7 +776,11 @@ export default function Home() {
                     </div>
                   </div>
 
-                  <ChronosHourglass progress={progress2026.ratio} remainingDays={progress2026.remainingDays} />
+                  <ChronosHourglass
+                    year={yearProgress.year}
+                    progress={yearProgress.ratio}
+                    remainingDays={yearProgress.remainingDays}
+                  />
                 </div>
               ) : (
                 <div className="space-y-2">
@@ -665,7 +834,7 @@ export default function Home() {
             onClick={() => {
               setActiveView(item);
             }}
-            className={`rounded-full px-7 py-2.5 text-[12px] tracking-[0.18em] transition-all duration-500 ${
+            className={`min-h-11 rounded-full px-7 py-2.5 text-[12px] tracking-[0.18em] transition-all duration-500 ${
               activeView === item
                 ? "bg-white/10 text-ghost-white"
                 : "text-slate-400 hover:text-ghost-white"
@@ -675,7 +844,7 @@ export default function Home() {
                 activeView === item ? "rgba(255,255,255,0.11)" : "rgba(255,255,255,0.05)",
               y: -1,
             }}
-            whileTap={{ scale: 0.98 }}
+            whileTap={{ scale: 0.95 }}
           >
             {item}
           </motion.button>
@@ -686,9 +855,11 @@ export default function Home() {
 }
 
 function ChronosHourglass({
+  year,
   progress,
   remainingDays,
 }: {
+  year: number;
   progress: number;
   remainingDays: number;
 }) {
@@ -750,7 +921,7 @@ function ChronosHourglass({
 
       <div>
         <p className="text-3xl font-thin tracking-wide text-ghost-white">
-          Year Progress: {`${(clamped * 100).toFixed(1)}%`}
+          {year} Progress: {`${(clamped * 100).toFixed(1)}%`}
         </p>
         <p className="mt-2 font-serif text-2xl text-slate-300">
           残り {remainingDays}日。君は何を成し遂げる？
